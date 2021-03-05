@@ -1,0 +1,116 @@
+---
+kind: pipeline
+type: docker
+name: pr-validate
+
+trigger:
+  event:
+    - pull_request
+    
+steps:
+- name: pr-runner
+  image: busybox 
+  commands:
+    - echo pr was opened
+
+---
+kind: pipeline
+type: docker
+name: localstack
+
+platform:
+  os: linux
+  arch: amd64
+
+trigger:
+  branch:
+    - master
+  event:
+    - push
+
+steps:
+- name: prepare-localstack-dirs
+  image: busybox
+  commands:
+    - mkdir -p /localstack/${DRONE_REPO}/data
+  volumes:
+    - name: localstack-dir
+      path: /localstack
+
+- name: wait-for-localstack
+  image: ruanbekker/curl
+  commands:
+    - |
+      for attempt in $(seq 1 60); 
+      do 
+        status=$(curl --max-time 1 --fail --silent http://localstack:4568/health | jq -r .services.s3)
+        if [[ $status == "running" ]]
+          then 
+            echo localstack services is in a running state
+            exit 0
+        fi
+      sleep 1
+      echo localstack services busy starting
+      done
+
+- name: setup-aws-credentials
+  image: busybox 
+  environment:
+    AWS_CREDENTIALS:
+      from_secret: AWS_CREDENTIALS
+  commands:
+    - mkdir -p $$DRONE_WORKSPACE/.aws
+    - echo $${AWS_CREDENTIALS} | base64 -d > $$DRONE_WORKSPACE/.aws/credentials
+    - chmod 0400 $$DRONE_WORKSPACE/.aws/credentials
+  volumes:
+    - name: cache
+      path: /tmp
+
+- name: terraform-init
+  image: hashicorp/terraform:light 
+  commands:
+  - terraform -chdir=./infra init
+
+- name: terraform-plan
+  image: hashicorp/terraform:light 
+  commands:
+  - terraform -chdir=./infra output -json
+  - terraform -chdir=./infra plan
+
+# to promote step see:
+# https://vitobotta.com/2019/10/09/ci-cd-with-drone-for-deployment-to-kubernetes-with-helm/
+- name: terraform-apply
+  image: hashicorp/terraform:light 
+  commands:
+  - terraform -chdir=./infra apply -input=false -auto-approve
+
+services:
+- name: localstack
+  image: localstack/localstack
+  privileged: true
+  environment:
+    DOCKER_HOST: unix:///var/run/docker.sock
+    DATA_DIR: /tmp/localstack/data
+    EDGE_PORT: "4568"
+  volumes:
+    - name: docker-socket
+      path: /var/run/docker.sock
+    - name: localstack-data
+      path: /tmp/localstack
+  ports:
+    - 8080
+
+volumes:
+- name: localstack-vol
+  temp: {}
+- name: cache
+  temp: {}
+- name: docker-socket
+  host:
+    path: /var/run/docker.sock
+- name: localstack-dir
+  host:
+    path: /Users/ruan/test
+- name: localstack-data
+  host:
+    path: /Users/ruan/test/${DRONE_REPO}/data
